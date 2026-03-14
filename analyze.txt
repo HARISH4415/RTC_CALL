@@ -1,0 +1,6 @@
+﻿Analyzing rtc...
+
+warning - lib\call_page.dart:151:21 - The operand can't be 'null', so the condition is always 'true'. Remove the condition. - unnecessary_null_comparison
+   info - lib\auth_page.dart:72:13 - Don't invoke 'print' in production code. Try using a logging framework. - avoid_print
+
+2 issues found.
