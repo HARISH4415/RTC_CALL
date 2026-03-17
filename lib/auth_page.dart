@@ -67,9 +67,16 @@ class _AuthPageState extends State<AuthPage> {
               'phone': _phoneController.text.trim(),
               'name': _nameController.text.trim(),
               'role': _role,
+              'is_online': true,
+              'last_seen': DateTime.now().toUtc().toIso8601String(),
             });
           } catch (e) {
-            print("Could not insert profile: $e");
+            debugPrint("CORE ERROR: Could not sync profile to Database. This is usually an RLS or Table issue: $e");
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(content: Text('Auth successful, but profile setup failed: $e')),
+              );
+            }
           }
         }
       } else {

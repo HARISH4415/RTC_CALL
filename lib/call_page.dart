@@ -1,18 +1,22 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:flutter_callkit_incoming/flutter_callkit_incoming.dart';
+import 'package:uuid/uuid.dart';
 
 class CallPage extends StatefulWidget {
   final String peerId;
   final bool isCaller;
   final Map<String, dynamic>? initialOffer;
+  final String? callSessionId;
 
   const CallPage({
     super.key,
     required this.peerId,
     required this.isCaller,
     this.initialOffer,
+    this.callSessionId,
   });
 
   @override
@@ -24,13 +28,15 @@ class _CallPageState extends State<CallPage> {
   RTCPeerConnection? _peerConnection;
   MediaStream? _localStream;
   RealtimeChannel? _signalingChannel;
-  bool _isCallActive = false;
   String? _callRecordId;
   String? _myProfileName;
   String? _myProfilePhone;
+  late String _sessionId;
 
   final RTCVideoRenderer _remoteRenderer = RTCVideoRenderer();
   bool _isSpeakerOn = false;
+  bool _isHangingUp = false;
+  String _statusMessage = "Connecting...";
 
   late String _myId;
 
@@ -55,10 +61,15 @@ class _CallPageState extends State<CallPage> {
     ],
   };
 
+  Timer? _ringingTimer;
+
   @override
   void initState() {
     super.initState();
     _myId = _supabase.auth.currentUser!.id;
+    // Use existing sessionId or create new one for this call
+    _sessionId = widget.callSessionId ??
+        const Uuid().v4(); // Need to import uuid or use a random string
     _fetchMyProfile();
     init();
   }
@@ -104,8 +115,20 @@ class _CallPageState extends State<CallPage> {
       }
       await _createOffer();
       await _recordCallToDb();
+      if (mounted) {
+        setState(() {
+          _statusMessage = "Ringing...";
+        });
+      }
+      // Start a 45 second ringing timer
+      _ringingTimer = Timer(const Duration(seconds: 45), () {
+        if (!_isHangingUp && !_answerReceived) {
+          _hangUp(remoteHangup: false);
+        }
+      });
     } else if (widget.initialOffer != null) {
       debugPrint('Signaling: Handling incoming offer from ${widget.peerId}');
+      await _recordCallToDb();
       // The peer connection might still be initializing media
       await Future.delayed(const Duration(milliseconds: 800));
       await _handleOffer(widget.initialOffer!);
@@ -114,31 +137,39 @@ class _CallPageState extends State<CallPage> {
 
   Future<void> _recordCallToDb() async {
     try {
+      // Use the session ID as the primary key or a unique field to avoid duplicates
+      // if both users try to create the same record.
       final res = await _supabase
           .from('call_history')
           .insert({
-            'caller_id': _myId,
-            'callee_id': widget.peerId,
+            'session_id': _sessionId,
+            'caller_id': widget.isCaller ? _myId : widget.peerId,
+            'callee_id': widget.isCaller ? widget.peerId : _myId,
             'status': 'started',
+            'started_at': DateTime.now().toUtc().toIso8601String(),
           })
           .select()
-          .single();
-      _callRecordId = res['id'].toString();
+          .maybeSingle();
+      
+      if (res != null) {
+        _callRecordId = res['id'].toString();
+      }
     } catch (e) {
       debugPrint('Error recording call history: $e');
     }
   }
 
   Future<void> _endCallInDb() async {
-    if (_callRecordId != null) {
-      try {
-        await _supabase
-            .from('call_history')
-            .update({'status': 'ended'})
-            .eq('id', _callRecordId!);
-      } catch (e) {
-        debugPrint('Error updating call history: $e');
-      }
+    try {
+      await _supabase
+          .from('call_history')
+          .update({
+            'status': 'ended',
+            'ended_at': DateTime.now().toUtc().toIso8601String(),
+          })
+          .eq('session_id', _sessionId);
+    } catch (e) {
+      debugPrint('Error updating call history: $e');
     }
   }
 
@@ -199,29 +230,32 @@ class _CallPageState extends State<CallPage> {
 
     _peerConnection!.onConnectionState = (state) {
       if (state == RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
-        setState(() => _isCallActive = true);
+        setState(() {
+          _statusMessage = "Call in progress";
+        });
       } else if (state ==
               RTCPeerConnectionState.RTCPeerConnectionStateDisconnected ||
           state == RTCPeerConnectionState.RTCPeerConnectionStateFailed) {
-        _hangUp();
+        _hangUp(remoteHangup: true);
       }
     };
 
     _peerConnection!.onIceConnectionState = (state) {
       if (state == RTCIceConnectionState.RTCIceConnectionStateConnected) {
-        setState(() => _isCallActive = true);
+        setState(() {
+          _statusMessage = "Call in progress";
+        });
       } else if (state ==
               RTCIceConnectionState.RTCIceConnectionStateDisconnected ||
           state == RTCIceConnectionState.RTCIceConnectionStateFailed) {
-        _hangUp();
+        _hangUp(remoteHangup: true);
       }
     };
   }
 
   void _connectSignaling() {
-    // Send signals to PEER_ID, but listen on MY_ID
-    // To keep it simple, we use two separate channel references
-    _signalingChannel = _supabase.channel('signaling:$_myId');
+    // Isolated channel for this specific call session
+    _signalingChannel = _supabase.channel('call_session:$_sessionId');
 
     _signalingChannel!
         .onBroadcast(
@@ -244,7 +278,31 @@ class _CallPageState extends State<CallPage> {
           event: 'call_end',
           callback: (payload) async {
             debugPrint('SIGNAL: Received call_end');
-            _hangUp(remoteHangup: true);
+            final data = payload['payload'] ?? payload;
+            final reason = data['data']?['reason'];
+            if (mounted) {
+              setState(() {
+                _statusMessage = reason == 'declined' ? "Call Declined" : "Call Ended";
+              });
+            }
+            // Wait a moment to show the message before popping
+            Future.delayed(const Duration(seconds: 1), () {
+              _hangUp(remoteHangup: true);
+            });
+          },
+        )
+        .onBroadcast(
+          event: 'call_busy',
+          callback: (payload) async {
+            debugPrint('SIGNAL: Received call_busy');
+            if (mounted) {
+              setState(() {
+                _statusMessage = "User is Busy";
+              });
+            }
+            Future.delayed(const Duration(seconds: 2), () {
+              _hangUp(remoteHangup: true);
+            });
           },
         )
         .subscribe((status, error) async {
@@ -257,18 +315,22 @@ class _CallPageState extends State<CallPage> {
   }
 
   void _sendSignal(String event, dynamic payloadData) async {
-    // Create a temporary channel to PUSH to the peer's inbox
-    final peerChannel = _supabase.channel('signaling:${widget.peerId}');
+    // Re-use the existing active signaling channel if possible
+    final RealtimeChannel channel = _signalingChannel ?? 
+        _supabase.channel('call_session:$_sessionId');
     
-    // We don't need to subscribe to push a broadcast
-    await peerChannel.sendBroadcastMessage(
-      event: event,
-      payload: {
-        "caller": _myId,
-        "data": payloadData,
-      },
-    );
-    _supabase.removeChannel(peerChannel);
+    try {
+      await channel.sendBroadcastMessage(
+        event: event,
+        payload: {
+          "caller": _myId,
+          "data": payloadData,
+        },
+      );
+      debugPrint('SIGNAL SENT: $event');
+    } catch (e) {
+      debugPrint('Error sending signal $event: $e');
+    }
   }
 
   Future<void> _createOffer() async {
@@ -278,28 +340,40 @@ class _CallPageState extends State<CallPage> {
     });
     await _peerConnection!.setLocalDescription(offer);
 
-    await Future.delayed(const Duration(milliseconds: 500));
-
-    debugPrint('SIGNAL: Pushing call_offer to signaling:${widget.peerId}');
+    debugPrint('SIGNAL: Pushing call_offer to general signaling channel');
     final peerChannel = _supabase.channel('signaling:${widget.peerId}');
-    await peerChannel.sendBroadcastMessage(
-      event: 'call_offer',
-      payload: {
-        "target": widget.peerId,
-        "caller": _myId,
-        "caller_name": _myProfileName ?? "Call from $_myId",
-        "caller_phone": _myProfilePhone ?? "Unknown",
-        "data": offer.toMap(),
-      },
-    );
-    _supabase.removeChannel(peerChannel);
+    try {
+      await peerChannel.sendBroadcastMessage(
+        event: 'call_offer',
+        payload: {
+          "target": widget.peerId,
+          "caller": _myId,
+          "caller_name": _myProfileName ?? "Call from $_myId",
+          "caller_phone": _myProfilePhone ?? "Unknown",
+          "session_id": _sessionId,
+          "data": offer.toMap(),
+        },
+      );
+      debugPrint('Offer sent successfully');
+    } catch (e) {
+      debugPrint('Error sending call_offer: $e');
+    }
+    
+    // Safety delay to ensure broadcast is processed before removing channel
+    Future.delayed(const Duration(seconds: 1), () {
+      _supabase.removeChannel(peerChannel);
+    });
   }
 
   Future<void> _handleOffer(Map<String, dynamic> payload) async {
     final sdpMap = payload['data'];
-    await _peerConnection!.setRemoteDescription(
-      RTCSessionDescription(sdpMap['sdp'], sdpMap['type']),
-    );
+    try {
+      await _peerConnection!.setRemoteDescription(
+        RTCSessionDescription(sdpMap['sdp'], sdpMap['type']),
+      );
+    } catch (e) {
+      debugPrint('Error setting remote description (offer): $e');
+    }
 
     _isRemoteDescriptionSet = true;
     for (var c in _remoteCandidatesQueue) {
@@ -317,10 +391,15 @@ class _CallPageState extends State<CallPage> {
   }
 
   Future<void> _handleAnswer(Map<String, dynamic> payload) async {
+    _ringingTimer?.cancel();
     final sdpMap = payload['data'];
-    await _peerConnection!.setRemoteDescription(
-      RTCSessionDescription(sdpMap['sdp'], sdpMap['type']),
-    );
+    try {
+      await _peerConnection!.setRemoteDescription(
+        RTCSessionDescription(sdpMap['sdp'], sdpMap['type']),
+      );
+    } catch (e) {
+      debugPrint('Error setting remote description (answer): $e');
+    }
 
     _isRemoteDescriptionSet = true;
     for (var c in _remoteCandidatesQueue) {
@@ -355,12 +434,13 @@ class _CallPageState extends State<CallPage> {
   }
 
   void _hangUp({bool remoteHangup = false}) async {
+    if (_isHangingUp) return;
+    _isHangingUp = true;
+
     if (!remoteHangup) {
       _sendSignal('call_end', {});
     }
-    if (widget.isCaller) {
-      await _endCallInDb();
-    }
+    await _endCallInDb();
     
     // Clear CallKit for the receiver
     try {
@@ -368,16 +448,18 @@ class _CallPageState extends State<CallPage> {
     } catch (_) {}
 
     if (mounted) {
-      Navigator.pop(context);
+      Navigator.of(context).pop();
     }
   }
 
   @override
   void dispose() {
+    _ringingTimer?.cancel();
     _localStream?.getTracks().forEach((track) {
       track.stop();
     });
     _peerConnection?.dispose();
+    // Safely unsubscribe from the session-specific channel
     _signalingChannel?.unsubscribe();
     _remoteRenderer.dispose();
     super.dispose();
@@ -394,7 +476,7 @@ class _CallPageState extends State<CallPage> {
             const Icon(Icons.record_voice_over, size: 100, color: Colors.white),
             const SizedBox(height: 30),
             Text(
-              _isCallActive ? "Call in progress" : "Connecting...",
+              _statusMessage,
               style: const TextStyle(
                 color: Colors.white,
                 fontSize: 24,
