@@ -15,7 +15,7 @@ void main() async {
     anonKey: 'sb_publishable_2_yoOv9cvKOf005tTIVOFQ_uM6Ai4tr',
   );
 
-  // Initialize Workmanager for background tasks
+  // Initialize Workmanager for background tasks`
   Workmanager().initialize(
     callbackDispatcher,
     isInDebugMode: false,                                                                                             

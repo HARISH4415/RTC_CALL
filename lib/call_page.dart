@@ -68,7 +68,8 @@ class _CallPageState extends State<CallPage> {
     super.initState();
     _myId = _supabase.auth.currentUser!.id;
     // Use existing sessionId or create new one for this call
-    _sessionId = widget.callSessionId ??
+    _sessionId =
+        widget.callSessionId ??
         const Uuid().v4(); // Need to import uuid or use a random string
     _fetchMyProfile();
     init();
@@ -150,7 +151,7 @@ class _CallPageState extends State<CallPage> {
           })
           .select()
           .maybeSingle();
-      
+
       if (res != null) {
         _callRecordId = res['id'].toString();
       }
@@ -282,7 +283,9 @@ class _CallPageState extends State<CallPage> {
             final reason = data['data']?['reason'];
             if (mounted) {
               setState(() {
-                _statusMessage = reason == 'declined' ? "Call Declined" : "Call Ended";
+                _statusMessage = reason == 'declined'
+                    ? "Call Declined"
+                    : "Call Ended";
               });
             }
             // Wait a moment to show the message before popping
@@ -316,16 +319,13 @@ class _CallPageState extends State<CallPage> {
 
   void _sendSignal(String event, dynamic payloadData) async {
     // Re-use the existing active signaling channel if possible
-    final RealtimeChannel channel = _signalingChannel ?? 
-        _supabase.channel('call_session:$_sessionId');
-    
+    final RealtimeChannel channel =
+        _signalingChannel ?? _supabase.channel('call_session:$_sessionId');
+
     try {
       await channel.sendBroadcastMessage(
         event: event,
-        payload: {
-          "caller": _myId,
-          "data": payloadData,
-        },
+        payload: {"caller": _myId, "data": payloadData},
       );
       debugPrint('SIGNAL SENT: $event');
     } catch (e) {
@@ -358,7 +358,7 @@ class _CallPageState extends State<CallPage> {
     } catch (e) {
       debugPrint('Error sending call_offer: $e');
     }
-    
+
     // Safety delay to ensure broadcast is processed before removing channel
     Future.delayed(const Duration(seconds: 1), () {
       _supabase.removeChannel(peerChannel);
@@ -441,7 +441,7 @@ class _CallPageState extends State<CallPage> {
       _sendSignal('call_end', {});
     }
     await _endCallInDb();
-    
+
     // Clear CallKit for the receiver
     try {
       await FlutterCallkitIncoming.endAllCalls();
